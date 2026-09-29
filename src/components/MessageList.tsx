@@ -96,7 +96,14 @@ function AttachmentView({ message }: { message: Message }) {
   );
 }
 
-export default function MessageList({ messages }: { messages: Message[] }) {
+export default function MessageList({
+  messages,
+  onRetry,
+}: {
+  /** `pending` marks a message still on its way; `failed` marks one that bounced. */
+  messages: (Message & { pending?: boolean; failed?: boolean })[];
+  onRetry?: (clientId: string) => void;
+}) {
   return (
     <>
       {messages.map((message, index) => {
@@ -113,7 +120,9 @@ export default function MessageList({ messages }: { messages: Message[] }) {
             GROUP_WINDOW_MS;
 
         return (
-          <div key={message.id}>
+          // Optimistic messages all arrive with id 0, so they key off their own
+          // client id until the stored one replaces them.
+          <div key={message.clientId ?? message.id}>
             {newDay && (
               <div className="my-4 flex items-center gap-3 px-2">
                 <div className="h-px flex-1 bg-line-strong" />
@@ -156,6 +165,18 @@ export default function MessageList({ messages }: { messages: Message[] }) {
                   </p>
                 )}
                 <AttachmentView message={message} />
+                {message.pending &&
+                  (message.failed ? (
+                    <button
+                      type="button"
+                      onClick={() => onRetry?.(message.clientId as string)}
+                      className="mt-0.5 text-[11px] font-medium text-danger transition hover:underline"
+                    >
+                      Not sent — tap to retry
+                    </button>
+                  ) : (
+                    <p className="mt-0.5 text-[11px] text-faint">Sending…</p>
+                  ))}
               </div>
             </div>
           </div>

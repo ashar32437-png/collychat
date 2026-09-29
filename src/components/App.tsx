@@ -20,7 +20,17 @@ import type { ToolKey } from "./tools/meta";
 import { Avatar } from "./avatar";
 import { buildSidebarItems } from "@/lib/sidebar";
 import type { DmSidebarItem, SidebarItem } from "@/lib/sidebar";
-import type { Conversation, ConversationInfo, DmItem, GroupItem, Message, SyncResponse, User } from "@/lib/types";
+import { isBanned } from "@/lib/types";
+import type {
+  Conversation,
+  ConversationInfo,
+  DmItem,
+  GroupItem,
+  Message,
+  OutboxMessage,
+  SyncResponse,
+  User,
+} from "@/lib/types";
 
 function useInterval(callback: () => void, delay: number | null) {
   const ref = useRef(callback);
@@ -41,6 +51,14 @@ function mergeMessages(previous: Message[], incoming: Message[]): Message[] {
   return merged;
 }
 
+/** The browser's own id for a message, so a resend cannot post it twice. */
+function newClientId(): string {
+  if (typeof crypto !== "undefined" && typeof crypto.randomUUID === "function") {
+    return crypto.randomUUID().replace(/-/g, "");
+  }
+  return Math.random().toString(36).slice(2) + Date.now().toString(36);
+}
+
 const toInfo = (conversation: {
   id: number;
   kind: Conversation["kind"];
@@ -54,6 +72,12 @@ const toInfo = (conversation: {
   slug: conversation.slug,
   members: conversation.members ?? [],
 });
+
+/** A message that is on its way, plus what we need to send it again. */
+type OutboxEntry = OutboxMessage & {
+  cacheKey: string;
+  request: { attachmentId: number | null; gifUrl: string | null };
+};
 
 function ToolHeader({ tool, onClose }: { tool: ToolKey; onClose: () => void }) {
   return (
@@ -80,6 +104,8 @@ export default function App() {
   /** the server could not reach its database — signing in cannot work */
   const [dbError, setDbError] = useState(false);
   const [syncFailed, setSyncFailed] = useState(false);
+  /** set while an admin is previewing another account (read-only) */
+  const [viewAs, setViewAs] = useState<User | null>(null);
 
   const [activeTool, setActiveTool] = useState<ToolKey | null>(null);
   const [mountedTools, setMountedTools] = useState<ToolKey[]>([]);
@@ -88,6 +114,8 @@ export default function App() {
   const [conv, setConv] = useState<ConversationInfo | null>(null);
   const [pendingDm, setPendingDm] = useState<DmSidebarItem | null>(null);
   const [messages, setMessages] = useState<Message[]>([]);
+  /** sent but not yet stored — shown immediately so the box never waits */
+  const [outbox, setOutbox] = useState<OutboxEntry[]>([]);
   const [dms, setDms] = useState<DmItem[]>([]);
   const [groups, setGroups] = useState<GroupItem[]>([]);
   const [rooms, setRooms] = useState<Conversation[]>([]);
@@ -104,6 +132,46 @@ export default function App() {
   const scrollRef = useRef<HTMLDivElement | null>(null);
   const syncingRef = useRef(false);
   const syncQueuedRef = useRef(false);
+  const viewAsRef = useRef<User | null>(null);
+  /** what is on screen right now, readable without waiting for a render */
+  const messagesRef = useRef<Message[]>([]);
+  /**
+   * Conversations already visited, so going back to one is instant instead of
+   * another round trip. Keyed per account, because a preview must never show
+   * the admin's own history — or the other way round.
+   */
+  const msgCacheRef = useRef(new Map<string, Message[]>());
+  const convCacheRef = useRef(new Map<string, ConversationInfo>());
+  const lastIdCacheRef = useRef(new Map<string, number>());
+
+  const cacheKey = useCallback(
+    (conversationId: number) => (viewAsRef.current?.id ?? 0) + ":" + conversationId,
+    []
+  );
+
+  /** Single place that changes what the message pane shows, so the cache and
+   *  the scroll cursor can never drift away from it. */
+  const showMessages = useCallback(
+    (conversationId: number, list: Message[]) => {
+      messagesRef.current = list;
+      setMessages(list);
+      const key = cacheKey(conversationId);
+      msgCacheRef.current.set(key, list);
+      const last = list.length ? list[list.length - 1].id : 0;
+      lastIdCacheRef.current.set(key, last);
+      if (convKeyRef.current === "c:" + conversationId) lastIdRef.current = last;
+    },
+    [cacheKey]
+  );
+
+  /** Anything the server confirms by client id is no longer waiting. */
+  const dropConfirmed = useCallback((incoming: Message[]) => {
+    const confirmed = incoming
+      .map((message) => message.clientId)
+      .filter((id): id is string => Boolean(id));
+    if (confirmed.length === 0) return;
+    setOutbox((previous) => previous.filter((item) => !confirmed.includes(item.clientId)));
+  }, []);
 
   useEffect(() => {
     if (!activeTool) return;
@@ -145,7 +213,11 @@ export default function App() {
       const res = await fetch("/api/sync", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ conversationId, afterId }),
+        body: JSON.stringify({
+          conversationId,
+          afterId,
+          viewAsUserId: viewAsRef.current?.id ?? null,
+        }),
         cache: "no-store",
         // Give up on a wedged server instead of waiting on it forever.
         signal: AbortSignal.timeout(15000),
@@ -167,29 +239,43 @@ export default function App() {
     setSyncFailed(false);
     if (key !== convKeyRef.current) return;
 
+    // The server decides whether the preview is still on — it may have been
+    // dropped because the account vanished, or because we stopped being admin.
+    if ((data.viewAs?.id ?? null) !== (viewAsRef.current?.id ?? null)) {
+      viewAsRef.current = data.viewAs ?? null;
+      setViewAs(data.viewAs ?? null);
+      convKeyRef.current = "none";
+      lastIdRef.current = 0;
+      messagesRef.current = [];
+      setMessages([]);
+      setConv(null);
+      setPendingDm(null);
+      setLoadingMessages(false);
+      // Re-run straight away, now against the corrected account.
+      syncQueuedRef.current = true;
+      return;
+    }
+
     setDms(data.dms ?? []);
     setGroups(data.groups ?? []);
     setRooms(data.channels ?? []);
     setActiveUsers(data.active ?? []);
     if (data.me) setMe(data.me);
-    if (data.conversation) setConv(data.conversation);
-
-    if (Array.isArray(data.messages)) {
-      if (afterId === 0) {
-        setMessages(data.messages);
-        lastIdRef.current = data.messages.length
-          ? data.messages[data.messages.length - 1].id
-          : 0;
-        setLoadingMessages(false);
-      } else if (data.messages.length > 0) {
-        setMessages((previous) => mergeMessages(previous, data.messages ?? []));
-        lastIdRef.current = Math.max(
-          lastIdRef.current,
-          data.messages[data.messages.length - 1].id
-        );
-      }
+    if (data.conversation) {
+      convCacheRef.current.set(cacheKey(data.conversation.id), data.conversation);
+      setConv(data.conversation);
     }
-  }, [me?.approved]);
+
+    if (Array.isArray(data.messages) && conversationId != null) {
+      dropConfirmed(data.messages);
+      if (afterId === 0) {
+        showMessages(conversationId, data.messages);
+      } else if (data.messages.length > 0) {
+        showMessages(conversationId, mergeMessages(messagesRef.current, data.messages));
+      }
+      setLoadingMessages(false);
+    }
+  }, [me?.approved, cacheKey, dropConfirmed, showMessages]);
 
   /**
    * The poll is the app's heartbeat, so it must never overlap itself.
@@ -227,7 +313,7 @@ export default function App() {
   useEffect(() => {
     const element = scrollRef.current;
     if (element && nearBottomRef.current) element.scrollTop = element.scrollHeight;
-  }, [messages]);
+  }, [messages, outbox]);
 
   // Keyed on id + approval so the sync itself refreshing `me` can't loop.
   const meKey = me ? me.id + ":" + (me.approved ? "1" : "0") : "";
@@ -235,17 +321,212 @@ export default function App() {
     if (meKey.endsWith(":1")) void sync();
   }, [meKey, sync]);
 
+  // ---------------------------------------------------------- sending
+  /**
+   * Hand a message to the outbox. The caller gets an answer straight away —
+   * "queued" — because the bubble is already on screen and the network part
+   * happens behind it. That is the whole point: typing the next message must
+   * not wait on the last one.
+   */
+  const deliverMessage = useCallback(
+    async (entry: OutboxEntry) => {
+      const markFailed = () => {
+        setOutbox((previous) =>
+          previous.map((item) =>
+            item.clientId === entry.clientId ? { ...item, failed: true } : item
+          )
+        );
+      };
+      try {
+        const res = await fetch("/api/conversations/" + entry.conversationId + "/messages", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            body: entry.body,
+            attachmentId: entry.request.attachmentId,
+            gifUrl: entry.request.gifUrl,
+            clientId: entry.clientId,
+          }),
+        });
+        const data = await res.json().catch(() => ({}));
+        if (!res.ok) {
+          markFailed();
+          setError(typeof data?.error === "string" ? data.error : "Message failed to send");
+          return;
+        }
+        const stored = data as Message;
+        setOutbox((previous) => previous.filter((item) => item.clientId !== entry.clientId));
+        // Fold the stored copy into its conversation even if we have since
+        // wandered off to another one.
+        const cached = msgCacheRef.current.get(entry.cacheKey) ?? [];
+        const merged = mergeMessages(cached, [stored]);
+        msgCacheRef.current.set(entry.cacheKey, merged);
+        lastIdCacheRef.current.set(
+          entry.cacheKey,
+          Math.max(lastIdCacheRef.current.get(entry.cacheKey) ?? 0, stored.id)
+        );
+        if (convKeyRef.current === "c:" + entry.conversationId) {
+          showMessages(entry.conversationId, merged);
+          nearBottomRef.current = true;
+        }
+        setError(null);
+      } catch {
+        markFailed();
+        setError("Message failed to send");
+      }
+    },
+    [showMessages]
+  );
+
+  const queueMessage = useCallback(
+    (conversationId: number, payload: ComposerPayload, author: User): void => {
+      const entry: OutboxEntry = {
+        id: 0,
+        pending: true,
+        clientId: newClientId(),
+        conversationId,
+        authorId: author.id,
+        authorName: author.displayName,
+        authorAvatarUrl: author.avatarUrl,
+        body: payload.body,
+        attachment: payload.attachment,
+        createdAt: new Date().toISOString(),
+        cacheKey: cacheKey(conversationId),
+        request: { attachmentId: payload.attachmentId, gifUrl: payload.gifUrl },
+      };
+      setOutbox((previous) => [...previous, entry]);
+      nearScrollToBottom();
+      void deliverMessage(entry);
+    },
+    [cacheKey, deliverMessage]
+  );
+
+  function nearScrollToBottom() {
+    nearBottomRef.current = true;
+  }
+
+  function retryMessage(clientId: string) {
+    const entry = outbox.find((item) => item.clientId === clientId);
+    if (!entry) return;
+    setOutbox((previous) =>
+      previous.map((item) => (item.clientId === clientId ? { ...item, failed: undefined } : item))
+    );
+    void deliverMessage(entry);
+  }
+
+  async function send(payload: ComposerPayload): Promise<boolean> {
+    const current = me;
+    if (!current?.approved) return false;
+    if (viewAsRef.current) {
+      setError("You're previewing " + viewAsRef.current.displayName + " — exit the preview to send.");
+      return false;
+    }
+
+    const open =
+      convKeyRef.current.startsWith("c:") ? Number(convKeyRef.current.slice(2)) : null;
+
+    if (open != null) {
+      queueMessage(open, payload, current);
+      return true;
+    }
+
+    if (!pendingDm) return false;
+    // A brand-new DM has to exist before anything can be shown in it, so this
+    // one step is the only part of sending that still waits.
+    try {
+      const res = await fetch("/api/conversations", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ kind: "dm", userId: pendingDm.userId }),
+      });
+      const data = await res.json().catch(() => ({}));
+      if (!res.ok) {
+        setError(typeof data?.error === "string" ? data.error : "Could not open that DM");
+        return false;
+      }
+      const conversationId = data.id as number;
+      convKeyRef.current = "c:" + conversationId;
+      lastIdRef.current = 0;
+      showMessages(conversationId, []);
+      const info = toInfo(data);
+      convCacheRef.current.set(cacheKey(conversationId), info);
+      setConv(info);
+      setPendingDm(null);
+      setLoadingMessages(false);
+      queueMessage(conversationId, payload, current);
+      return true;
+    } catch {
+      setError("Could not open that DM");
+      return false;
+    }
+  }
+
   // ----------------------------------------------------------- navigation
+  /**
+   * Opening a conversation shows whatever we already have for it immediately,
+   * then quietly asks for anything newer. Waiting on a round trip before
+   * drawing anything is what made flicking between rooms and DMs feel slow.
+   */
+  const loadConversation = useCallback(
+    async (conversationId: number, afterId: number, key: string) => {
+      try {
+        const params = new URLSearchParams({ after: String(afterId) });
+        const previewId = viewAsRef.current?.id;
+        if (previewId) params.set("viewAs", String(previewId));
+        const res = await fetch(
+          "/api/conversations/" + conversationId + "/messages?" + params.toString(),
+          { cache: "no-store", signal: AbortSignal.timeout(15000) }
+        );
+        if (res.status === 401) {
+          setMe(null);
+          return;
+        }
+        if (!res.ok) return; // the poll reports trouble; this is only a shortcut
+        const data = (await res.json()) as {
+          conversation?: ConversationInfo | null;
+          messages?: Message[] | null;
+        };
+        if (convKeyRef.current !== "c:" + conversationId) return;
+        if (data.conversation) {
+          convCacheRef.current.set(key, data.conversation);
+          setConv(data.conversation);
+        }
+        const incoming = Array.isArray(data.messages) ? data.messages : [];
+        dropConfirmed(incoming);
+        showMessages(
+          conversationId,
+          afterId === 0 ? incoming : mergeMessages(messagesRef.current, incoming)
+        );
+        setLoadingMessages(false);
+      } catch {
+        /* the poll will report trouble */
+      }
+    },
+    [dropConfirmed, showMessages]
+  );
+
   function openConversation(conversationId: number, info?: ConversationInfo | null) {
     setActiveTool(null);
     convKeyRef.current = "c:" + conversationId;
-    lastIdRef.current = 0;
-    nearBottomRef.current = true;
-    setMessages([]);
-    setConv(info ?? null);
     setPendingDm(null);
-    setLoadingMessages(true);
-    void sync();
+    nearBottomRef.current = true;
+
+    const key = cacheKey(conversationId);
+    const cachedInfo = convCacheRef.current.get(key) ?? null;
+    const cached = msgCacheRef.current.get(key) ?? null;
+    const cachedLast = lastIdCacheRef.current.get(key) ?? 0;
+
+    setConv(info ?? cachedInfo ?? null);
+    if (cached) {
+      showMessages(conversationId, cached);
+      setLoadingMessages(false);
+    } else {
+      messagesRef.current = [];
+      setMessages([]);
+      lastIdRef.current = 0;
+      setLoadingMessages(true);
+    }
+    void loadConversation(conversationId, cached ? cachedLast : 0, key);
   }
 
   function openDm(item: SidebarItem) {
@@ -258,11 +539,14 @@ export default function App() {
       return;
     }
     if (item.id != null) {
-      openConversation(item.id);
+      // We already know this DM's id and who it is with, so the chat can open
+      // on the spot rather than flashing the welcome screen first.
+      openConversation(item.id, toInfo({ id: item.id, kind: "dm", name: item.name, slug: null }));
       return;
     }
     convKeyRef.current = "none";
     lastIdRef.current = 0;
+    messagesRef.current = [];
     setMessages([]);
     setConv(null);
     setPendingDm(item);
@@ -270,14 +554,38 @@ export default function App() {
     void sync();
   }
 
+  /** Enter or leave an admin's read-only preview of another account. */
+  const applyViewAs = useCallback(
+    (target: User | null) => {
+      viewAsRef.current = target;
+      setViewAs(target);
+      convKeyRef.current = "none";
+      lastIdRef.current = 0;
+      messagesRef.current = [];
+      setMessages([]);
+      setConv(null);
+      setPendingDm(null);
+      setLoadingMessages(false);
+      void sync();
+    },
+    [sync]
+  );
+
   async function logout() {
     try {
       await fetch("/api/auth/logout", { method: "POST" });
     } catch {
       /* ignore */
     }
+    viewAsRef.current = null;
+    setViewAs(null);
     convKeyRef.current = "none";
+    messagesRef.current = [];
     setMessages([]);
+    setOutbox([]);
+    msgCacheRef.current.clear();
+    convCacheRef.current.clear();
+    lastIdCacheRef.current.clear();
     setConv(null);
     setPendingDm(null);
     setActiveTool(null);
@@ -289,58 +597,6 @@ export default function App() {
     setActiveUsers([]);
     setError(null);
     setMe(null);
-  }
-
-  // --------------------------------------------------------------- actions
-  async function send(payload: ComposerPayload): Promise<boolean> {
-    const current = me;
-    if (!current?.approved) return false;
-    let conversationId = convKeyRef.current.startsWith("c:")
-      ? Number(convKeyRef.current.slice(2))
-      : null;
-
-    try {
-      if (conversationId == null) {
-        if (!pendingDm) return false;
-        const res = await fetch("/api/conversations", {
-          method: "POST",
-          headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ kind: "dm", userId: pendingDm.userId }),
-        });
-        const data = await res.json().catch(() => ({}));
-        if (!res.ok) {
-          setError(typeof data?.error === "string" ? data.error : "Could not open that DM");
-          return false;
-        }
-        conversationId = data.id as number;
-        convKeyRef.current = "c:" + conversationId;
-        lastIdRef.current = 0;
-        setMessages([]);
-        setConv(toInfo(data));
-        setPendingDm(null);
-      }
-
-      const res = await fetch("/api/conversations/" + conversationId + "/messages", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify(payload),
-      });
-      const data = await res.json().catch(() => ({}));
-      if (!res.ok) {
-        setError(typeof data?.error === "string" ? data.error : "Message failed to send");
-        return false;
-      }
-      const message = data as Message;
-      setMessages((previous) => mergeMessages(previous, [message]));
-      lastIdRef.current = Math.max(lastIdRef.current, message.id);
-      nearBottomRef.current = true;
-      setError(null);
-      void sync();
-      return true;
-    } catch {
-      setError("Message failed to send");
-      return false;
-    }
   }
 
   async function createGroup(name: string, memberIds: number[]) {
@@ -385,6 +641,28 @@ export default function App() {
     return <AuthPanel onAuthed={(user) => setMe(user)} dbError={dbError} />;
   }
 
+  if (isBanned(me)) {
+    return (
+      <div className="flex h-screen items-center justify-center bg-base px-6">
+        <div className="max-w-md text-center">
+          <h1 className="text-lg font-semibold text-ink">Account suspended</h1>
+          <p className="mt-2 text-sm leading-relaxed text-faint">
+            An admin suspended this account until{" "}
+            <span className="text-warn">{new Date(me.bannedUntil as string).toLocaleString()}</span>.
+            Your messages stay where they are.
+          </p>
+          <button
+            type="button"
+            onClick={() => void logout()}
+            className="mt-5 rounded-lg border border-line px-4 py-2 text-sm text-muted transition hover:bg-raised hover:text-ink"
+          >
+            Sign out
+          </button>
+        </div>
+      </div>
+    );
+  }
+
   if (!me.approved) {
     return (
       <PendingPanel user={me} onApproved={(user) => setMe(user)} onLogout={() => void logout()} />
@@ -426,6 +704,10 @@ export default function App() {
 
   const showMain = activeTool != null || activeConversationId != null || pendingDm != null;
   const hasConversation = activeConversationId != null || pendingDm != null;
+  const queued =
+    activeConversationId == null
+      ? []
+      : outbox.filter((item) => item.conversationId === activeConversationId);
 
   return (
     <div className="flex h-screen overflow-hidden bg-base">
@@ -444,7 +726,13 @@ export default function App() {
         items={sidebarItems}
         activeConversationId={activeConversationId}
         activeUserId={activeUserId}
-        onOpenRoom={(conversationId) => openConversation(conversationId)}
+        onOpenRoom={(conversationId) => {
+          const room = rooms.find((item) => item.id === conversationId);
+          openConversation(
+            conversationId,
+            room ? toInfo({ ...room, members: [] }) : null
+          );
+        }}
         onOpenItem={openDm}
         onNewGroup={() => {
           setGroupError(null);
@@ -456,6 +744,23 @@ export default function App() {
       />
 
       <main className={"min-w-0 flex-1 flex-col md:flex " + (showMain ? "flex" : "hidden")}>
+        {viewAs && (
+          <div className="flex h-11 shrink-0 items-center gap-3 border-b border-warn/30 bg-warn/10 px-4 text-xs text-warn">
+            <span className="h-1.5 w-1.5 shrink-0 rounded-full bg-warn" />
+            <span className="min-w-0 flex-1 truncate">
+              Viewing as <span className="font-semibold">{viewAs.displayName}</span> — read-only.
+              Their groups and DMs are exactly as they see them.
+            </span>
+            <button
+              type="button"
+              onClick={() => applyViewAs(null)}
+              className="shrink-0 rounded-md border border-warn/40 px-2.5 py-1 font-medium transition hover:bg-warn/15"
+            >
+              Exit preview
+            </button>
+          </div>
+        )}
+
         {mountedTools.map((key) => (
           <div
             key={key}
@@ -468,7 +773,9 @@ export default function App() {
               {key === "timer" && <TimerTool />}
               {key === "notes" && <NotesTool />}
               {key === "ai" && <AiTool />}
-              {key === "admin" && currentUser.isAdmin && <AdminTool me={currentUser} />}
+              {key === "admin" && currentUser.isAdmin && (
+                <AdminTool me={currentUser} onPreviewUser={applyViewAs} />
+              )}
             </div>
           </div>
         ))}
@@ -481,6 +788,7 @@ export default function App() {
                   type="button"
                   onClick={() => {
                     convKeyRef.current = "none";
+                    messagesRef.current = [];
                     setMessages([]);
                     setConv(null);
                     setPendingDm(null);
@@ -546,19 +854,26 @@ export default function App() {
                   <p className="pt-10 text-center text-sm text-faint">
                     {syncFailed ? "Reconnecting…" : "Loading…"}
                   </p>
-                ) : messages.length === 0 ? (
+                ) : messages.length === 0 && queued.length === 0 ? (
                   <p className="pt-10 text-center text-sm text-faint">
                     {syncFailed ? "Can't reach the server — retrying…" : "No messages yet."}
                   </p>
                 ) : (
-                  <MessageList messages={messages} />
+                  <MessageList
+                    messages={[...messages, ...(viewAs ? [] : queued)]}
+                    onRetry={retryMessage}
+                  />
                 )}
               </div>
 
               <Composer
-                placeholder={"Message " + (conv?.kind === "channel" ? "#" : "") + title}
+                placeholder={
+                  viewAs
+                    ? "Read-only preview — exit to send messages"
+                    : "Message " + (conv?.kind === "channel" ? "#" : "") + title
+                }
                 onSend={send}
-                disabled={pendingDm == null && conv?.id == null}
+                disabled={viewAs != null || (pendingDm == null && conv?.id == null)}
               />
             </>
           ) : (

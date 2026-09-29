@@ -28,10 +28,35 @@ export type User = {
   status: PresenceStatus;
   isAdmin: boolean;
   approved: boolean;
+  /** silenced until this moment; null when they may speak freely */
+  mutedUntil?: string | null;
+  /** locked out until this moment; null when they may sign in */
+  bannedUntil?: string | null;
   lastSeenAt?: string | null;
   /** true when the person has been seen inside the presence window */
   active?: boolean;
 };
+
+const stillInFuture = (iso: string | null | undefined): boolean => {
+  if (!iso) return false;
+  const at = new Date(iso).getTime();
+  return Number.isFinite(at) && at > Date.now();
+};
+
+/** Feature routes ask this before letting anyone write or sign in. */
+export const isMuted = (user: User | null | undefined): boolean =>
+  stillInFuture(user?.mutedUntil);
+
+export const isBanned = (user: User | null | undefined): boolean =>
+  stillInFuture(user?.bannedUntil);
+
+export const MUTE_OPTIONS = [
+  { label: "15 minutes", minutes: 15 },
+  { label: "1 hour", minutes: 60 },
+  { label: "8 hours", minutes: 480 },
+  { label: "24 hours", minutes: 1440 },
+  { label: "7 days", minutes: 10_080 },
+] as const;
 
 export type Credentials = User & { passwordHash: string };
 
@@ -72,6 +97,25 @@ export type Message = {
   body: string;
   attachment: Attachment | null;
   createdAt: string;
+  /**
+   * The browser's own id for a message it sent. It travels with the message so
+   * the optimistic copy on screen can be matched to the stored one exactly,
+   * instead of being guessed at from its wording.
+   */
+  clientId?: string | null;
+};
+
+/**
+ * A message shown the instant you press Enter, before the server has it.
+ *
+ * `pending` is what marks it out — not `clientId`, because a stored message
+ * carries its client id too (that is how the two get matched up), and stored
+ * messages are not being sent anywhere.
+ */
+export type OutboxMessage = Message & {
+  pending: true;
+  clientId: string;
+  failed?: boolean;
 };
 
 export type DmItem = {
@@ -86,6 +130,8 @@ export type DmItem = {
 
 export type SyncResponse = {
   me: User;
+  /** set only while an admin is previewing another account (read-only) */
+  viewAs: User | null;
   active: User[];
   dms: DmItem[];
   groups: GroupItem[];
@@ -123,7 +169,16 @@ export interface StoreApi {
   getUser(id: number): Promise<User | null>;
   listUsers(): Promise<User[]>;
   updateUser(id: number, patch: ProfilePatch): Promise<User | null>;
-  setUserFlags(id: number, flags: { isAdmin?: boolean; approved?: boolean }): Promise<User | null>;
+  setUserFlags(
+    id: number,
+    flags: {
+      isAdmin?: boolean;
+      approved?: boolean;
+      /** ISO timestamp, or null to lift the silence / the lockout */
+      mutedUntil?: string | null;
+      bannedUntil?: string | null;
+    }
+  ): Promise<User | null>;
   setPassword(id: number, passwordHash: string): Promise<void>;
   touchPresence(userId: number): Promise<void>;
   listActiveUsers(sinceIso: string, excludeUserId: number): Promise<User[]>;
@@ -146,11 +201,17 @@ export interface StoreApi {
 
   // messages
   listMessages(conversationId: number, afterId: number, limit: number): Promise<Message[]>;
+  /**
+   * `clientId` makes the write idempotent: sending the same one twice — a
+   * retry, or a reply whose response was lost — returns the message that is
+   * already stored instead of posting a second copy.
+   */
   createMessage(
     conversationId: number,
     authorId: number,
     body: string,
-    attachmentId: number | null
+    attachmentId: number | null,
+    clientId?: string | null
   ): Promise<Message>;
 
   // attachments

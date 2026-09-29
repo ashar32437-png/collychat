@@ -19,6 +19,8 @@ const MAX_IMAGE_EDGE = 1600;
 export type ComposerPayload = {
   body: string;
   attachmentId: number | null;
+  /** the same attachment, whole, so the optimistic bubble can draw it */
+  attachment: Attachment | null;
   gifUrl: string | null;
 };
 
@@ -37,7 +39,6 @@ export default function Composer({
   const [pending, setPending] = useState<Attachment | null>(null);
   const [uploading, setUploading] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
-  const [sending, setSending] = useState(false);
 
   const [gifQuery, setGifQuery] = useState("");
   const [gifs, setGifs] = useState<GifResult[]>([]);
@@ -112,26 +113,51 @@ export default function Composer({
     }
   }
 
-  async function send() {
+  /**
+   * The box empties itself straight away and the network is left to catch up.
+   * Waiting for the round trip here is what made fast typing feel sticky: the
+   * next message could not even be typed until the last one had been stored.
+   * `onSend` hands the message to the outbox, so by the time it answers we have
+   * already moved on; it only returns false when the message could not be
+   * queued at all, and then the words go back into the box.
+   */
+  function send() {
     const text = draft.trim();
-    if ((!text && !pending) || sending || disabled) return;
-    setSending(true);
-    const ok = await onSend({
+    const attachment = pending;
+    if ((!text && !attachment) || disabled) return;
+    const payload: ComposerPayload = {
       body: text,
-      attachmentId: pending ? pending.id : null,
+      attachmentId: attachment ? attachment.id : null,
+      attachment,
       gifUrl: null,
+    };
+    setDraft("");
+    setPending(null);
+    setNotice(null);
+    void onSend(payload).then((queued) => {
+      if (queued) return;
+      setDraft((current) => (current ? current : text));
+      setPending((current) => current ?? attachment);
     });
-    if (ok) {
-      setDraft("");
-      setPending(null);
-      setNotice(null);
-    }
-    setSending(false);
   }
 
-  async function sendGif(result: GifResult) {
+  function sendGif(result: GifResult) {
     closeMenu();
-    await onSend({ body: "", attachmentId: null, gifUrl: result.gif });
+    void onSend({
+      body: "",
+      attachmentId: null,
+      // Shown immediately; the server swaps in the real attachment row.
+      attachment: {
+        id: 0,
+        filename: "giphy.gif",
+        contentType: "image/gif",
+        sizeBytes: 0,
+        url: result.gif,
+        isImage: true,
+        remoteUrl: result.gif,
+      },
+      gifUrl: result.gif,
+    });
   }
 
   return (

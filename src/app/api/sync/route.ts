@@ -3,7 +3,7 @@ import { currentUser } from "@/lib/auth";
 import { signInRequired } from "@/lib/guard";
 import { store } from "@/lib/store";
 import { ACTIVE_WINDOW_MS } from "@/lib/types";
-import type { ConversationInfo, DmItem, GroupItem, SyncResponse } from "@/lib/types";
+import type { ConversationInfo, DmItem, GroupItem, SyncResponse, User } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
@@ -18,22 +18,33 @@ export async function POST(req: Request) {
   const body = await req.json().catch(() => null);
   const rawAfter = Number(body?.afterId);
   const rawConversation = Number(body?.conversationId);
+  const rawViewAs = Number(body?.viewAsUserId);
   const afterId = Number.isFinite(rawAfter) && rawAfter > 0 ? rawAfter : 0;
   const conversationId =
     Number.isFinite(rawConversation) && rawConversation > 0 ? rawConversation : null;
 
   try {
+    // "View as" lets an admin walk through someone else's side of the app —
+    // their DMs, their groups, their history — without signing in as them. It is
+    // strictly read-only: it changes whose conversations we look up, never who
+    // is asking, and every write route still works from the admin's own id.
+    let viewAs: User | null = null;
+    if (user.isAdmin && Number.isInteger(rawViewAs) && rawViewAs > 0 && rawViewAs !== user.id) {
+      viewAs = await store.getUser(rawViewAs);
+    }
+    const subject = viewAs ?? user;
+
     await store.touchPresence(user.id);
 
     const sinceIso = new Date(Date.now() - ACTIVE_WINDOW_MS).toISOString();
     const [active, myDms, myGroups, channels] = await Promise.all([
-      store.listActiveUsers(sinceIso, user.id),
-      store.listMyConversations(user.id, "dm"),
-      store.listMyConversations(user.id, "group"),
+      store.listActiveUsers(sinceIso, subject.id),
+      store.listMyConversations(subject.id, "dm"),
+      store.listMyConversations(subject.id, "group"),
       store.listChannels(),
     ]);
 
-    const activeIds = new Set(active.map((user) => user.id));
+    const activeIds = new Set(active.map((person) => person.id));
     const lastTimes = await store.lastMessageTimes([
       ...myDms.map((item) => item.id),
       ...myGroups.map((item) => item.id),
@@ -43,7 +54,7 @@ export async function POST(req: Request) {
     const dms: DmItem[] = [];
     for (const conversation of myDms) {
       const members = await store.listMembers(conversation.id);
-      const partner = members.find((member) => member.id !== user.id);
+      const partner = members.find((member) => member.id !== subject.id);
       if (!partner) continue;
       dms.push({
         userId: partner.id,
@@ -91,7 +102,7 @@ export async function POST(req: Request) {
     if (conversationId != null) {
       const found = await store.getConversation(conversationId);
       const allowed =
-        found && (found.kind === "channel" || (await store.isMember(conversationId, user.id)));
+        found && (found.kind === "channel" || (await store.isMember(conversationId, subject.id)));
       if (!found || !allowed) {
         return NextResponse.json({ error: "Conversation not found" }, { status: 404 });
       }
@@ -104,6 +115,7 @@ export async function POST(req: Request) {
 
     const payload: SyncResponse = {
       me: user,
+      viewAs,
       active,
       dms,
       groups,

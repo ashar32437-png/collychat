@@ -146,7 +146,7 @@ const SCHEMA = [
   "CREATE TABLE IF NOT EXISTS conversations (id SERIAL PRIMARY KEY, kind TEXT NOT NULL, name TEXT NOT NULL, slug TEXT, dm_key TEXT UNIQUE, created_by INTEGER REFERENCES users(id) ON DELETE SET NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now())",
   "CREATE TABLE IF NOT EXISTS conversation_members (conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, joined_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (conversation_id, user_id))",
   "CREATE TABLE IF NOT EXISTS attachments (id SERIAL PRIMARY KEY, uploader_id INTEGER REFERENCES users(id) ON DELETE SET NULL, filename TEXT NOT NULL, content_type TEXT NOT NULL, size_bytes INTEGER NOT NULL, data BYTEA, remote_url TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now())",
-  "CREATE TABLE IF NOT EXISTS messages (id SERIAL PRIMARY KEY, conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE, author_id INTEGER REFERENCES users(id) ON DELETE SET NULL, body TEXT NOT NULL DEFAULT '', attachment_id INTEGER REFERENCES attachments(id) ON DELETE SET NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now())",
+  "CREATE TABLE IF NOT EXISTS messages (id SERIAL PRIMARY KEY, conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE, author_id INTEGER REFERENCES users(id) ON DELETE SET NULL, body TEXT NOT NULL DEFAULT '', attachment_id INTEGER REFERENCES attachments(id) ON DELETE SET NULL, client_id TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now())",
   "CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
   "CREATE INDEX IF NOT EXISTS messages_conversation_idx ON messages (conversation_id, id)",
   "CREATE INDEX IF NOT EXISTS conversation_members_user_idx ON conversation_members (user_id)",
@@ -164,11 +164,18 @@ const MIGRATIONS = [
   "ALTER TABLE users ADD COLUMN IF NOT EXISTS is_admin BOOLEAN NOT NULL DEFAULT false",
   "ALTER TABLE users ADD COLUMN IF NOT EXISTS status TEXT NOT NULL DEFAULT 'active'",
   "ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_attachment_id INTEGER",
+  "ALTER TABLE users ADD COLUMN IF NOT EXISTS muted_until TIMESTAMPTZ",
+  "ALTER TABLE users ADD COLUMN IF NOT EXISTS banned_until TIMESTAMPTZ",
+  // The column has to exist before the index that leans on it — an older
+  // database has the messages table already, without either.
+  "ALTER TABLE messages ADD COLUMN IF NOT EXISTS client_id TEXT",
+  // One row per browser-sent message, so a resend cannot post it twice.
+  "CREATE UNIQUE INDEX IF NOT EXISTS messages_client_idx ON messages (client_id) WHERE client_id IS NOT NULL",
 ];
 
 // Bump this whenever SCHEMA or MIGRATIONS changes, so existing databases run the
 // new statements once and then stop paying for them.
-const SCHEMA_VERSION = "1";
+const SCHEMA_VERSION = "2";
 
 let schemaPromise: Promise<void> | null = null;
 

@@ -11,6 +11,7 @@ import {
 } from "@/lib/auth";
 import { ensureBootstrap } from "@/lib/bootstrap";
 import { store } from "@/lib/store";
+import { isBanned } from "@/lib/types";
 
 export const dynamic = "force-dynamic";
 
@@ -39,6 +40,19 @@ export async function POST(req: Request) {
     if (!credentials || !valid) {
       recordFailure(username);
       return NextResponse.json({ error: "That username and password don't match" }, { status: 401 });
+    }
+    if (isBanned(credentials)) {
+      // Say so plainly rather than letting them in and cutting them off on the
+      // next request, which looks like the app being broken.
+      return NextResponse.json(
+        {
+          error:
+            "This account is suspended until " +
+            new Date(credentials.bannedUntil as string).toLocaleString(),
+          bannedUntil: credentials.bannedUntil,
+        },
+        { status: 403 }
+      );
     }
     clearFailures(username);
     const { token, tokenHash } = newSessionToken();

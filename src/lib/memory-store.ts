@@ -24,6 +24,8 @@ type MemUser = {
   status: PresenceStatus;
   isAdmin: boolean;
   approved: boolean;
+  mutedUntil: string | null;
+  bannedUntil: string | null;
   lastSeenAt: number | null;
 };
 
@@ -41,6 +43,7 @@ type MemMessage = {
   authorId: number;
   body: string;
   attachmentId: number | null;
+  clientId: string | null;
   createdAt: string;
 };
 
@@ -86,6 +89,8 @@ const toUser = (user: MemUser): User => ({
   status: user.status,
   isAdmin: user.isAdmin,
   approved: user.approved,
+  mutedUntil: user.mutedUntil,
+  bannedUntil: user.bannedUntil,
   lastSeenAt: user.lastSeenAt ? new Date(user.lastSeenAt).toISOString() : null,
 });
 
@@ -117,6 +122,7 @@ function toMessage(message: MemMessage): Message {
   return {
     id: message.id,
     conversationId: message.conversationId,
+    clientId: message.clientId,
     authorId: message.authorId,
     authorName: author?.displayName ?? "Deleted user",
     authorAvatarUrl: author ? avatarUrlFor(author.avatarAttachmentId) : null,
@@ -137,6 +143,8 @@ export const memoryStore: StoreApi = {
       status: "active",
       isAdmin: Boolean(input.isAdmin),
       approved: Boolean(input.approved),
+      mutedUntil: null,
+      bannedUntil: null,
       lastSeenAt: Date.now(),
     };
     state.users.push(user);
@@ -179,6 +187,8 @@ export const memoryStore: StoreApi = {
     if (!user) return null;
     if (flags.isAdmin !== undefined) user.isAdmin = flags.isAdmin;
     if (flags.approved !== undefined) user.approved = flags.approved;
+    if (flags.mutedUntil !== undefined) user.mutedUntil = flags.mutedUntil;
+    if (flags.bannedUntil !== undefined) user.bannedUntil = flags.bannedUntil;
     return toUser(user);
   },
 
@@ -327,13 +337,18 @@ export const memoryStore: StoreApi = {
     return slice.map(toMessage);
   },
 
-  async createMessage(conversationId, authorId, body, attachmentId) {
+  async createMessage(conversationId, authorId, body, attachmentId, clientId = null) {
+    if (clientId) {
+      const already = state.messages.find((item) => item.clientId === clientId);
+      if (already) return toMessage(already);
+    }
     const message: MemMessage = {
       id: state.ids.message++,
       conversationId,
       authorId,
       body,
       attachmentId,
+      clientId,
       createdAt: new Date().toISOString(),
     };
     state.messages.push(message);

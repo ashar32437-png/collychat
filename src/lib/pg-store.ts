@@ -18,6 +18,8 @@ type UserRow = {
   status: string;
   isAdmin: boolean;
   approved: boolean;
+  mutedUntil?: string | null;
+  bannedUntil?: string | null;
   lastSeenAt?: string | null;
 };
 
@@ -31,6 +33,7 @@ type ConversationRow = {
 type MessageRow = {
   id: number;
   conversationId: number;
+  clientId?: string | null;
   authorId: number | null;
   authorName: string | null;
   authorAvatarAttachmentId: number | null;
@@ -44,6 +47,18 @@ type MessageRow = {
 };
 
 const STAMP = "'YYYY-MM-DD\"T\"HH24:MI:SS.MS\"Z\"'";
+
+// Timestamps go back to the browser as strings in the same shape messages use,
+// so the client can compare them without knowing about Date objects.
+function stampColumns(column: string): string {
+  return (
+    "to_char(" +
+    column +
+    " AT TIME ZONE 'UTC', " +
+    STAMP +
+    ")"
+  );
+}
 
 function userColumns(alias = ""): string {
   const p = alias ? alias + "." : "";
@@ -61,12 +76,17 @@ function userColumns(alias = ""): string {
     p +
     'is_admin AS "isAdmin", ' +
     p +
-    "approved"
+    "approved, " +
+    stampColumns(p + "muted_until") +
+    ' AS "mutedUntil", ' +
+    stampColumns(p + "banned_until") +
+    ' AS "bannedUntil"'
   );
 }
 
 const MESSAGE_SELECT =
-  "SELECT m.id, m.conversation_id AS \"conversationId\", m.author_id AS \"authorId\", " +
+  "SELECT m.id, m.conversation_id AS \"conversationId\", m.client_id AS \"clientId\", " +
+  "m.author_id AS \"authorId\", " +
   "COALESCE(u.display_name, 'Deleted user') AS \"authorName\", " +
   "u.avatar_attachment_id AS \"authorAvatarAttachmentId\", m.body, " +
   "to_char(m.created_at AT TIME ZONE 'UTC', " +
@@ -88,6 +108,8 @@ function toUser(row: UserRow): User {
     status: toStatus(row.status),
     isAdmin: row.isAdmin,
     approved: row.approved,
+    mutedUntil: row.mutedUntil ?? null,
+    bannedUntil: row.bannedUntil ?? null,
   };
 }
 
@@ -95,6 +117,7 @@ function toMessage(row: MessageRow): Message {
   return {
     id: row.id,
     conversationId: row.conversationId,
+    clientId: row.clientId ?? null,
     authorId: row.authorId ?? 0,
     authorName: row.authorName ?? "Deleted user",
     authorAvatarUrl: row.authorAvatarAttachmentId
@@ -198,6 +221,14 @@ export const pgStore: StoreApi = {
     if (flags.approved !== undefined) {
       params.push(flags.approved);
       sets.push("approved = $" + params.length);
+    }
+    if (flags.mutedUntil !== undefined) {
+      params.push(flags.mutedUntil);
+      sets.push("muted_until = $" + params.length + "::timestamptz");
+    }
+    if (flags.bannedUntil !== undefined) {
+      params.push(flags.bannedUntil);
+      sets.push("banned_until = $" + params.length + "::timestamptz");
     }
     if (sets.length === 0) return pgStore.getUser(id);
     params.push(id);
@@ -397,13 +428,20 @@ export const pgStore: StoreApi = {
     return rows.map(toMessage);
   },
 
-  async createMessage(conversationId, authorId, body, attachmentId) {
+  async createMessage(conversationId, authorId, body, attachmentId, clientId = null) {
     await ensureSchema();
     const inserted = await query<{ id: number }>(
-      "INSERT INTO messages (conversation_id, author_id, body, attachment_id) VALUES ($1, $2, $3, $4) RETURNING id",
-      [conversationId, authorId, body, attachmentId]
+      "INSERT INTO messages (conversation_id, author_id, body, attachment_id, client_id) " +
+        "VALUES ($1, $2, $3, $4, $5) " +
+        // A resend of something already stored inserts nothing and falls through
+        // to the lookup below, so a lost response cannot double-post.
+        "ON CONFLICT (client_id) WHERE client_id IS NOT NULL DO NOTHING RETURNING id",
+      [conversationId, authorId, body, attachmentId, clientId]
     );
-    const rows = await query<MessageRow>(MESSAGE_SELECT + "WHERE m.id = $1", [inserted[0].id]);
+    const id = inserted[0]?.id;
+    const rows = id
+      ? await query<MessageRow>(MESSAGE_SELECT + "WHERE m.id = $1", [id])
+      : await query<MessageRow>(MESSAGE_SELECT + "WHERE m.client_id = $1", [clientId]);
     return toMessage(rows[0]);
   },
 
