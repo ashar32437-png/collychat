@@ -8,7 +8,14 @@ import {
 } from "@/lib/types";
 import type { User } from "@/lib/types";
 
-export default function AuthPanel({ onAuthed }: { onAuthed: (user: User) => void }) {
+export default function AuthPanel({
+  onAuthed,
+  dbError = false,
+}: {
+  onAuthed: (user: User) => void;
+  /** the server can't reach its database, so nothing on this screen can succeed */
+  dbError?: boolean;
+}) {
   const [mode, setMode] = useState<"login" | "register">("login");
   const [username, setUsername] = useState("");
   const [password, setPassword] = useState("");
@@ -70,6 +77,14 @@ export default function AuthPanel({ onAuthed }: { onAuthed: (user: User) => void
         <h1 className="text-center text-[26px] font-semibold tracking-tight text-ink">
           Just a messaging app.
         </h1>
+
+        {dbError && (
+          <p className="mt-6 rounded-xl border border-warn/30 bg-warn/10 px-3.5 py-3 text-xs leading-relaxed text-warn">
+            <span className="font-semibold">The server can't reach its database.</span> Signing in
+            and creating an account will both fail until that is fixed — check the value of
+            DATABASE_URL in the environment the app is running on.
+          </p>
+        )}
 
         <div className="card-shadow mt-7 rounded-2xl border border-line bg-panel p-5">
           <div className="mb-5 flex gap-1 rounded-lg bg-base p-1">

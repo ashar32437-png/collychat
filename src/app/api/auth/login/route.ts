@@ -15,8 +15,6 @@ import { store } from "@/lib/store";
 export const dynamic = "force-dynamic";
 
 export async function POST(req: Request) {
-  await ensureBootstrap();
-
   const body = await req.json().catch(() => null);
   const username = typeof body?.username === "string" ? normalizeUsername(body.username) : "";
   const password = typeof body?.password === "string" ? body.password : "";
@@ -33,6 +31,9 @@ export async function POST(req: Request) {
   }
 
   try {
+    // Inside the try so an unreachable database comes back as our own error
+    // message rather than a bare 500 the browser can only render as a blank page.
+    await ensureBootstrap();
     const credentials = await store.findCredentials(username);
     const valid = credentials ? await verifyPassword(password, credentials.passwordHash) : false;
     if (!credentials || !valid) {
@@ -47,6 +48,8 @@ export async function POST(req: Request) {
     const { passwordHash: _ignored, ...user } = credentials;
     return NextResponse.json({ user: { ...user, active: true } });
   } catch (err) {
+    // This is nearly always a database problem (bad credentials, unreachable
+    // host) rather than anything the person typing can fix.
     console.error("login failed", err);
     return NextResponse.json({ error: "Could not sign you in" }, { status: 500 });
   }

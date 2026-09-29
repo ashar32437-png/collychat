@@ -77,6 +77,8 @@ function ToolHeader({ tool, onClose }: { tool: ToolKey; onClose: () => void }) {
 export default function App() {
   const [me, setMe] = useState<User | null>(null);
   const [checked, setChecked] = useState(false);
+  /** the server could not reach its database — signing in cannot work */
+  const [dbError, setDbError] = useState(false);
 
   const [activeTool, setActiveTool] = useState<ToolKey | null>(null);
   const [mountedTools, setMountedTools] = useState<ToolKey[]>([]);
@@ -116,6 +118,7 @@ export default function App() {
         const data = await res.json();
         if (cancelled) return;
         if (data?.user) setMe(data.user as User);
+        setDbError(Boolean(data?.dbError));
       } catch {
         /* offline — show the login screen */
       } finally {
@@ -337,7 +340,7 @@ export default function App() {
   }
 
   if (!me) {
-    return <AuthPanel onAuthed={(user) => setMe(user)} />;
+    return <AuthPanel onAuthed={(user) => setMe(user)} dbError={dbError} />;
   }
 
   if (!me.approved) {
