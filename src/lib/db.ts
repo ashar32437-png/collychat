@@ -40,21 +40,94 @@ export const hasDb = Boolean(url);
 // Add `?sslmode=disable` to the URL for a local database that has no TLS.
 const sslOptions: { ssl?: "require" } = url && !/sslmode=/.test(url) ? { ssl: "require" } : {};
 
-export const sql = url
-  ? postgres(url, {
-      max: 5,
-      idle_timeout: 20,
-      connect_timeout: 10,
-      prepare: false, // required by pooled providers (Neon, Supabase pooler)
-      ...sslOptions,
-    })
-  : (null as unknown as postgres.Sql);
+/**
+ * Nothing below the database may hang forever.
+ *
+ * Serverless hosts suspend instances while their TCP sockets stay open, and a
+ * connection pooler will drop a client it considers idle and forget about it.
+ * Either way postgres.js can hold a socket that will never answer, and by
+ * default it waits on it indefinitely — the request never completes and the
+ * browser sits on "Loading…" until someone reloads. Every query therefore runs
+ * under a deadline of our own, and connections are retired after a minute so a
+ * stale socket cannot be handed out for long.
+ *
+ * The deadline has to be client-side: Supabase's pooler silently ignores
+ * connection-string parameters like statement_timeout, so asking the server to
+ * enforce one does nothing.
+ */
+const QUERY_TIMEOUT_MS = 8000;
+
+const POOL_OPTIONS = {
+  // Small on purpose: every serverless instance gets its own pool, and the
+  // pooler in front of the database has a modest limit of its own.
+  max: 3,
+  idle_timeout: 10,
+  connect_timeout: 10,
+  max_lifetime: 60,
+  prepare: false, // required by pooled providers (Neon, Supabase pooler)
+  ...sslOptions,
+};
+
+function openPool(): postgres.Sql | null {
+  return url ? postgres(url, POOL_OPTIONS) : null;
+}
+
+let pool = openPool();
+
+/**
+ * The pool is replaceable on purpose.
+ *
+ * postgres.js cannot cancel a single query, so a connection that outstays its
+ * deadline stays checked out for the life of the process. Once a few of those
+ * pile up, every later request queues behind a slot that will never free, and
+ * the app stops answering for good — which is how the site ended up stuck on
+ * "Loading" with a reload as the only way out. Dropping the pool costs one
+ * reconnect (~250ms) and always recovers.
+ */
+function recycle(dead: postgres.Sql): void {
+  if (pool !== dead) return; // another timeout already swapped it out
+  pool = openPool();
+  void dead.end({ timeout: 2 }).catch(() => {});
+}
+
+class QueryTimeoutError extends Error {
+  constructor(label: string) {
+    super("Database did not answer within " + QUERY_TIMEOUT_MS + "ms: " + label.slice(0, 80));
+    this.name = "QueryTimeoutError";
+  }
+}
+
+function withDeadline<T>(work: PromiseLike<T>, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new QueryTimeoutError(label)), QUERY_TIMEOUT_MS);
+    Promise.resolve(work).then(
+      (value) => {
+        clearTimeout(timer);
+        resolve(value);
+      },
+      (error) => {
+        clearTimeout(timer);
+        reject(error);
+      }
+    );
+  });
+}
 
 // Every query goes through here so the Postgres backend reads like plain SQL.
 export async function query<T>(text: string, params: unknown[] = []): Promise<T[]> {
-  if (!sql) throw new Error("DATABASE_URL is not set");
-  const rows = (await sql.unsafe(text, params as never)) as unknown as T[];
-  return rows ?? [];
+  const active = pool;
+  if (!active) throw new Error("DATABASE_URL is not set");
+  try {
+    const rows = (await withDeadline(
+      active.unsafe(text, params as never),
+      text
+    )) as unknown as T[];
+    return rows ?? [];
+  } catch (error) {
+    // The query we walked away from holds its connection open forever.
+    if (error instanceof QueryTimeoutError) recycle(active);
+    throw error;
+  }
 }
 
 // One shared room: the "everyone" chat. Add more here if you want extra rooms.
@@ -67,6 +140,7 @@ const SCHEMA = [
   "CREATE TABLE IF NOT EXISTS conversation_members (conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE, user_id INTEGER NOT NULL REFERENCES users(id) ON DELETE CASCADE, joined_at TIMESTAMPTZ NOT NULL DEFAULT now(), PRIMARY KEY (conversation_id, user_id))",
   "CREATE TABLE IF NOT EXISTS attachments (id SERIAL PRIMARY KEY, uploader_id INTEGER REFERENCES users(id) ON DELETE SET NULL, filename TEXT NOT NULL, content_type TEXT NOT NULL, size_bytes INTEGER NOT NULL, data BYTEA, remote_url TEXT, created_at TIMESTAMPTZ NOT NULL DEFAULT now())",
   "CREATE TABLE IF NOT EXISTS messages (id SERIAL PRIMARY KEY, conversation_id INTEGER NOT NULL REFERENCES conversations(id) ON DELETE CASCADE, author_id INTEGER REFERENCES users(id) ON DELETE SET NULL, body TEXT NOT NULL DEFAULT '', attachment_id INTEGER REFERENCES attachments(id) ON DELETE SET NULL, created_at TIMESTAMPTZ NOT NULL DEFAULT now())",
+  "CREATE TABLE IF NOT EXISTS app_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL)",
   "CREATE INDEX IF NOT EXISTS messages_conversation_idx ON messages (conversation_id, id)",
   "CREATE INDEX IF NOT EXISTS conversation_members_user_idx ON conversation_members (user_id)",
   "CREATE INDEX IF NOT EXISTS sessions_user_idx ON sessions (user_id)",
@@ -85,6 +159,10 @@ const MIGRATIONS = [
   "ALTER TABLE users ADD COLUMN IF NOT EXISTS avatar_attachment_id INTEGER",
 ];
 
+// Bump this whenever SCHEMA or MIGRATIONS changes, so existing databases run the
+// new statements once and then stop paying for them.
+const SCHEMA_VERSION = "1";
+
 let schemaPromise: Promise<void> | null = null;
 
 export function ensureSchema(): Promise<void> {
@@ -97,6 +175,18 @@ export function ensureSchema(): Promise<void> {
   return schemaPromise;
 }
 
+async function storedSchemaVersion(): Promise<string | null> {
+  try {
+    const rows = await query<{ value: string }>(
+      "SELECT value FROM app_meta WHERE key = 'schema_version'"
+    );
+    return rows[0]?.value ?? null;
+  } catch {
+    // No app_meta table yet — this database has never been set up.
+    return null;
+  }
+}
+
 async function columnExists(table: string, column: string): Promise<boolean> {
   const rows = await query<{ n: number }>(
     "SELECT count(*)::int AS n FROM information_schema.columns WHERE table_name = $1 AND column_name = $2",
@@ -107,6 +197,11 @@ async function columnExists(table: string, column: string): Promise<boolean> {
 
 async function runSchema(): Promise<void> {
   if (!hasDb) return;
+
+  // The cheap path. A warm database answers with one small SELECT instead of
+  // running fifteen lock-taking DDL statements on every cold start — which is
+  // both slow and a chance to be frozen half way through.
+  if ((await storedSchemaVersion()) === SCHEMA_VERSION) return;
 
   // The first beta used messages.channel_id. If that table is still around,
   // park it under a new name instead of destroying the rows.
@@ -133,4 +228,9 @@ async function runSchema(): Promise<void> {
       [name]
     );
   }
+
+  await query(
+    "INSERT INTO app_meta (key, value) VALUES ('schema_version', $1) ON CONFLICT (key) DO UPDATE SET value = EXCLUDED.value",
+    [SCHEMA_VERSION]
+  );
 }

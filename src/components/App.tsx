@@ -79,6 +79,7 @@ export default function App() {
   const [checked, setChecked] = useState(false);
   /** the server could not reach its database — signing in cannot work */
   const [dbError, setDbError] = useState(false);
+  const [syncFailed, setSyncFailed] = useState(false);
 
   const [activeTool, setActiveTool] = useState<ToolKey | null>(null);
   const [mountedTools, setMountedTools] = useState<ToolKey[]>([]);
@@ -101,6 +102,8 @@ export default function App() {
   const lastIdRef = useRef(0);
   const nearBottomRef = useRef(true);
   const scrollRef = useRef<HTMLDivElement | null>(null);
+  const syncingRef = useRef(false);
+  const syncQueuedRef = useRef(false);
 
   useEffect(() => {
     if (!activeTool) return;
@@ -131,7 +134,7 @@ export default function App() {
   }, []);
 
   // ------------------------------------------------------------------ sync
-  const sync = useCallback(async () => {
+  const runSync = useCallback(async () => {
     if (!me?.approved) return;
     const key = convKeyRef.current;
     const conversationId = key.startsWith("c:") ? Number(key.slice(2)) : null;
@@ -144,16 +147,24 @@ export default function App() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ conversationId, afterId }),
         cache: "no-store",
+        // Give up on a wedged server instead of waiting on it forever.
+        signal: AbortSignal.timeout(15000),
       });
       if (res.status === 401) {
         setMe(null);
         return;
       }
-      if (!res.ok) return;
+      if (!res.ok) throw new Error("sync failed: " + res.status);
       data = (await res.json()) as SyncResponse;
     } catch {
+      // Returning quietly is what used to strand the pane on "Loading…" for
+      // good: nothing ever cleared `loadingMessages`, so a server that stopped
+      // answering looked like an app that had frozen. Say what is happening,
+      // and leave the poll running — it recovers on its own.
+      setSyncFailed(true);
       return;
     }
+    setSyncFailed(false);
     if (key !== convKeyRef.current) return;
 
     setDms(data.dms ?? []);
@@ -179,6 +190,37 @@ export default function App() {
       }
     }
   }, [me?.approved]);
+
+  /**
+   * The poll is the app's heartbeat, so it must never overlap itself.
+   *
+   * The interval fires every 2.5s whether or not the last request has come
+   * back. While the server answers quickly that is harmless, but the moment one
+   * tick runs slow — a cold database, a busy connection pool, a blip — the next
+   * tick stacks up behind it and the one after that stacks behind *that*. The
+   * backlog only grows, so nothing new ever renders and the app sits on
+   * "Loading" until someone reloads. One request at a time means the queue can
+   * never be deeper than one, and recovery is automatic.
+   */
+  const sync = useCallback(async () => {
+    if (!me?.approved) return;
+    if (syncingRef.current) {
+      // Remember it rather than dropping it, so opening a conversation still
+      // refreshes promptly instead of waiting for the next tick.
+      syncQueuedRef.current = true;
+      return;
+    }
+    syncingRef.current = true;
+    try {
+      await runSync();
+    } finally {
+      syncingRef.current = false;
+      if (syncQueuedRef.current) {
+        syncQueuedRef.current = false;
+        void sync();
+      }
+    }
+  }, [me?.approved, runSync]);
 
   useInterval(sync, me?.approved ? 2500 : null);
 
@@ -477,6 +519,13 @@ export default function App() {
                 )}
 
                 <h1 className="truncate text-[15px] font-semibold text-ink">{title}</h1>
+
+                {syncFailed && (
+                  <span className="flex shrink-0 items-center gap-1.5 text-[11px] font-medium text-warn">
+                    <span className="h-1.5 w-1.5 rounded-full bg-warn" />
+                    Reconnecting…
+                  </span>
+                )}
               </header>
 
               {error && (
@@ -494,9 +543,13 @@ export default function App() {
                 className="flex-1 overflow-y-auto px-4 pb-2 pt-3"
               >
                 {loadingMessages ? (
-                  <p className="pt-10 text-center text-sm text-faint">Loading…</p>
+                  <p className="pt-10 text-center text-sm text-faint">
+                    {syncFailed ? "Reconnecting…" : "Loading…"}
+                  </p>
                 ) : messages.length === 0 ? (
-                  <p className="pt-10 text-center text-sm text-faint">No messages yet.</p>
+                  <p className="pt-10 text-center text-sm text-faint">
+                    {syncFailed ? "Can't reach the server — retrying…" : "No messages yet."}
+                  </p>
                 ) : (
                   <MessageList messages={messages} />
                 )}
