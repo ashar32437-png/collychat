@@ -1,6 +1,26 @@
 import postgres from "postgres";
 
-const url = process.env.DATABASE_URL?.trim();
+/**
+ * Read the connection string defensively. Dashboards hand values over wrapped in
+ * quotes — Supabase's own connect snippet shows `DATABASE_URL="postgresql://…"`
+ * — and a stray quote makes postgres.js throw, which fails the whole build with a
+ * message about whichever route it happened to load first.
+ */
+function connectionString(): string | undefined {
+  const raw = process.env.DATABASE_URL?.trim();
+  if (!raw) return undefined;
+
+  const cleaned = raw.replace(/^["']+|["']+$/g, "").trim();
+  if (!/^postgres(ql)?:\/\//i.test(cleaned)) {
+    throw new Error(
+      "DATABASE_URL is not a valid Postgres connection string — it should start with " +
+        "postgresql://. Remove any surrounding quotes, spaces or line breaks from the value."
+    );
+  }
+  return cleaned;
+}
+
+const url = connectionString();
 
 export const hasDb = Boolean(url);
 

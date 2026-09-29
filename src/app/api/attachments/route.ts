@@ -5,8 +5,6 @@ import { MAX_ATTACHMENT_BYTES } from "@/lib/types";
 import { acceptUpload } from "@/lib/uploads";
 
 export const dynamic = "force-dynamic";
-// 5 MB of upload plus multipart overhead.
-export const maxDuration = 60;
 
 export async function POST(req: Request) {
   const me = await currentUser();
