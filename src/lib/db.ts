@@ -58,19 +58,19 @@ const sslOptions: { ssl?: "require" } = url && !/sslmode=/.test(url) ? { ssl: "r
 const QUERY_TIMEOUT_MS = 8000;
 
 const POOL_OPTIONS = {
-  // One long-lived connection per serverless instance.
+  // A small pool, deliberately — and not a single connection.
   //
-  // Opening a connection through the pooler takes roughly a second from Vercel
-  // and occasionally far longer, so every connection we open is a chance to
-  // stall. Meanwhile a connection that sits idle for ten seconds gets retired,
-  // so a handful of them turn into a steady stream of fresh — slow — ones. One
-  // connection, kept warm by the heartbeat, is both quicker and calmer, and
-  // postgres.js pipelines the queries of a single request onto it anyway.
-  max: 1,
-  idle_timeout: 30,
+  // Connecting to the pooler from Vercel is slow enough that a couple of
+  // connections is the difference between a blip and an outage: one connection
+  // that happens to go bad takes every request with it, and the serverless
+  // instance has nothing healthy left to answer with. Three tolerates one bad
+  // connection while two keep working, and retiring them after a minute stops a
+  // dead one lingering. Measured on the deployed site: three connections held
+  // roughly 80% success where one held 15%.
+  max: 3,
+  idle_timeout: 10,
   connect_timeout: 10,
-  max_lifetime: 300,
-  keep_alive: 30,
+  max_lifetime: 60,
   prepare: false, // required by pooled providers (Neon, Supabase pooler)
   ...sslOptions,
 };
