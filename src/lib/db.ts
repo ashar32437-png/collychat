@@ -1,20 +1,30 @@
 import postgres from "postgres";
 
 /**
- * Read the connection string defensively. Dashboards hand values over wrapped in
- * quotes — Supabase's own connect snippet shows `DATABASE_URL="postgresql://…"`
- * — and a stray quote makes postgres.js throw, which fails the whole build with a
- * message about whichever route it happened to load first.
+ * Read the connection string the way people actually paste it.
+ *
+ * Supabase's connect snippet is a whole .env line — `DATABASE_URL="postgresql://…"`
+ * — and pasting that into a dashboard's *value* box is an easy mistake, since the
+ * value box only wants the part after the `=`. Quotes have the same effect: they
+ * make postgres.js throw, and because Next imports this module while collecting
+ * page data, the build then dies naming an unrelated route.
  */
 function connectionString(): string | undefined {
   const raw = process.env.DATABASE_URL?.trim();
   if (!raw) return undefined;
 
-  const cleaned = raw.replace(/^["']+|["']+$/g, "").trim();
+  const cleaned = raw
+    .replace(/^export\s+/i, "")
+    .replace(/^DATABASE_URL\s*=\s*/i, "")
+    .trim()
+    .replace(/^["']+|["']+$/g, "")
+    .trim();
+
   if (!/^postgres(ql)?:\/\//i.test(cleaned)) {
     throw new Error(
       "DATABASE_URL is not a valid Postgres connection string — it should start with " +
-        "postgresql://. Remove any surrounding quotes, spaces or line breaks from the value."
+        "postgresql://. Give the value on its own, without the DATABASE_URL= prefix or " +
+        "surrounding quotes."
     );
   }
   return cleaned;
